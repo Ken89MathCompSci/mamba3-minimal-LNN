@@ -5,18 +5,26 @@ mamba3-minimal
 A minimal, single-file implementation of the Mamba-3 model in PyTorch.
 
 > **MAMBA-3: IMPROVED SEQUENCE MODELING USING STATE SPACE PRINCIPLES**
-> Paper: Under review at ICLR 2026
+> Paper: ICLR 2026 (Oral), arXiv:2603.15569
+> OpenReview: https://openreview.net/forum?id=HwCvaJOiCj
+> Code: https://github.com/state-spaces/mamba 
+> Authors: Lahoti, Li, Chen, Wang, Bick, Kolter, Dao, Gu
 
 Key innovations over Mamba-2:
-  1) Trapezoidal Discretization (Eq. 4) — second-order accurate state update
-  2) Complex-valued SSM / Data-Dependent RoPE (Eq. 9) — enables state-tracking
-  3) MIMO formulation (Appendix D) — improves hardware utilization during decode
-  4) QK-Normalization on B, C — replaces post-SSD norm
-  5) Learnable BC Bias — head-specific, channel-wise, initialized to ones
-  6) No short convolution — trapezoidal + bias makes conv1d unnecessary
+  1) Trapezoidal Discretization (Proposition 1, Eq. 3-5) — second-order accurate state update
+  2) Complex-valued SSM / Data-Dependent RoPE (Propositions 2-4, Eq. 6-9) — enables state-tracking
+  3) MIMO formulation (Section 3.3, Appendix D) — improves hardware utilization during decode
+  4) QK-Normalization on B, C (Section 3.4) — replaces post-SSD norm
+  5) Learnable BC Bias (Section 3.4, Appendix G) — head-specific, channel-wise, initialized to ones
+  6) No short convolution — trapezoidal + bias makes conv1d unnecessary (Tab. meth_abl)
 
 Architecture follows Llama design: alternating Mamba-3 SSM blocks and SwiGLU MLP
 blocks with pre-normalization (RMSNorm).
+
+Performance at 1.5B scale (100B FineWeb-Edu tokens):
+  - Mamba-3 SISO: +0.6 pts over GDN, +1.9 pts over Mamba-2
+  - Mamba-3 MIMO (R=4): +1.8 pts over GDN, +2.2 pts over Mamba-2
+  - MIMO d_state=64 ≈ Mamba-2 d_state=128 perplexity (2× faster decode)
 """
 
 import json
