@@ -24,6 +24,7 @@ import os
 import sys
 import json
 import math
+import pickle
 import numpy as np
 import torch
 import torch.nn as nn
@@ -32,15 +33,99 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from datetime import datetime
+from sklearn.preprocessing import MinMaxScaler
 from torch import Tensor
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from einops import rearrange, repeat
 
-# Import shared data loading and metric utilities
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Source Code'))
-from data_loader import load_and_preprocess_ukdale, explore_available_appliances
 from utils import calculate_nilm_metrics, save_model
+
+# ---------------------------------------------------------------------------
+# Constants  (matches test_multiscale_lnn_ukdale_specific_splits.py)
+# ---------------------------------------------------------------------------
+
+STRIDE = 5
+APPLIANCES = ['dish washer', 'fridge', 'microwave', 'washer dryer']
+THRESHOLDS = {
+    'dish washer':  10.0,
+    'fridge':       10.0,
+    'microwave':    10.0,
+    'washer dryer':  0.5,
+}
+
+
+# ---------------------------------------------------------------------------
+# Data helpers
+# ---------------------------------------------------------------------------
+
+class SimpleDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.FloatTensor(X)
+        self.y = torch.FloatTensor(y)
+    def __len__(self): return len(self.X)
+    def __getitem__(self, idx): return self.X[idx], self.y[idx]
+
+
+def load_data():
+    """Load raw UK-DALE DataFrames from data/ukdale/*.pkl"""
+    print("Loading UKDALE data...")
+    with open('data/ukdale/train_small.pkl', 'rb') as f:
+        train_data = pickle.load(f)[0]
+    with open('data/ukdale/val_small.pkl', 'rb') as f:
+        val_data = pickle.load(f)[0]
+    with open('data/ukdale/test_small.pkl', 'rb') as f:
+        test_data = pickle.load(f)[0]
+    print(f"Train: {train_data.index.min()} to {train_data.index.max()}")
+    print(f"Val:   {val_data.index.min()} to {val_data.index.max()}")
+    print(f"Test:  {test_data.index.min()} to {test_data.index.max()}")
+    print(f"Columns: {list(train_data.columns)}")
+    return {'train': train_data, 'val': val_data, 'test': test_data}
+
+
+def create_sequences(data, window_size=100):
+    mains = data['main'].values
+    X = []
+    for i in range(0, len(mains) - window_size + 1, STRIDE):
+        X.append(mains[i:i + window_size])
+    return np.array(X).reshape(-1, window_size, 1)
+
+
+def prepare_appliance_data(raw_data, appliance_name, window_size=100):
+    """Create scaled DataLoaders for one appliance from raw DataFrames."""
+    X_tr = create_sequences(raw_data['train'], window_size)
+    X_va = create_sequences(raw_data['val'],   window_size)
+    X_te = create_sequences(raw_data['test'],  window_size)
+
+    y_tr = raw_data['train'][appliance_name].iloc[::STRIDE].values.reshape(-1, 1)[:len(X_tr)]
+    y_va = raw_data['val'][appliance_name].iloc[::STRIDE].values.reshape(-1, 1)[:len(X_va)]
+    y_te = raw_data['test'][appliance_name].iloc[::STRIDE].values.reshape(-1, 1)[:len(X_te)]
+
+    x_scaler = MinMaxScaler()
+    y_scaler = MinMaxScaler()
+
+    X_tr = x_scaler.fit_transform(X_tr.reshape(-1, 1)).reshape(X_tr.shape)
+    X_va = x_scaler.transform(X_va.reshape(-1, 1)).reshape(X_va.shape)
+    X_te = x_scaler.transform(X_te.reshape(-1, 1)).reshape(X_te.shape)
+
+    y_tr = y_scaler.fit_transform(y_tr)
+    y_va = y_scaler.transform(y_va)
+    y_te = y_scaler.transform(y_te)
+
+    print(f"Training sequences:   {X_tr.shape}")
+    print(f"Validation sequences: {X_va.shape}")
+    print(f"Test sequences:       {X_te.shape}")
+
+    return {
+        'train_loader': DataLoader(SimpleDataset(X_tr, y_tr), batch_size=32, shuffle=True),
+        'val_loader':   DataLoader(SimpleDataset(X_va, y_va), batch_size=32, shuffle=False),
+        'test_loader':  DataLoader(SimpleDataset(X_te, y_te), batch_size=32, shuffle=False),
+        'y_scaler':       y_scaler,
+        'appliance_name': appliance_name,
+        'input_size':     1,
+        'output_size':    1,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -579,10 +664,12 @@ def train_ssd_lnn_model(data_dict, model_params, train_params, save_dir="models"
 
         all_targets = np.concatenate(all_targets)
         all_outputs = np.concatenate(all_outputs)
-        metrics = calculate_nilm_metrics(
-            all_targets, all_outputs,
-            scaler=data_dict.get("appliance_scaler"),
-        )
+        y_scaler = data_dict.get("y_scaler")
+        if y_scaler is not None:
+            all_targets = y_scaler.inverse_transform(all_targets.reshape(-1, 1)).flatten()
+            all_outputs = y_scaler.inverse_transform(all_outputs.reshape(-1, 1)).flatten()
+        threshold = data_dict.get("threshold", 10.0)
+        metrics = calculate_nilm_metrics(all_targets, all_outputs, threshold=threshold)
         history["val_metrics"].append(metrics)
 
         print(
@@ -649,15 +736,15 @@ def train_ssd_lnn_model(data_dict, model_params, train_params, save_dir="models"
 # Train on All Appliances  (mirrors train_tcn_lnn_all_appliances)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def train_ssd_lnn_all_appliances(house_number=1, window_size=128, save_dir="models/ssd_lnn"):
+def train_ssd_lnn_all_appliances(house_number=1, window_size=100, save_dir="models/ssd_lnn"):
     """Train SSD-LNN on all appliances in the specified UK-DALE house.
 
-    window_size is set to 128 (nearest multiple of chunk_size=32 above the
-    standard 100-sample window) so the chunked SSD can process it evenly.
+    Uses the same window_size=100 as train_tcn_lnn.py. chunk_size is set to 25
+    (a divisor of 100) so the chunked SSD can process it evenly (4 chunks of 25).
 
     Args:
         house_number: House number in the UK-DALE dataset
-        window_size:  Input sequence length (must be divisible by chunk_size=32)
+        window_size:  Input sequence length (must be divisible by chunk_size=25)
         save_dir:     Directory to save the models
 
     Returns:
@@ -667,19 +754,18 @@ def train_ssd_lnn_all_appliances(house_number=1, window_size=128, save_dir="mode
     base_save    = os.path.join(save_dir, f"house{house_number}_{timestamp}")
     os.makedirs(base_save, exist_ok=True)
 
-    file_path  = f"preprocessed_datasets/ukdale/ukdale{house_number}.mat"
-    appliances = explore_available_appliances(file_path)
+    # Load data once, then loop over appliances
+    raw_data = load_data()
+    appliances = {i: name for i, name in enumerate(APPLIANCES)}
 
-    print(f"Training SSD-LNN models for {len(appliances)} appliances in house {house_number}:")
+    print(f"Training SSD-LNN models for {len(appliances)} appliances:")
     for idx, name in appliances.items():
         print(f"  Index {idx}: {name}")
 
-    # Save run config
     config = {
-        "house_number": house_number,
-        "window_size":  window_size,
-        "timestamp":    timestamp,
-        "appliances":   appliances,
+        "window_size": window_size,
+        "timestamp":   timestamp,
+        "appliances":  appliances,
     }
     with open(os.path.join(base_save, "config.json"), "w") as f:
         json.dump(config, f, indent=4)
@@ -692,7 +778,7 @@ def train_ssd_lnn_all_appliances(house_number=1, window_size=128, save_dir="mode
         "d_state":       16,
         "expand":        2,
         "headdim":       16,
-        "chunk_size":    32,
+        "chunk_size":    25,
         "use_liquid":    True,
         "tau_min":       0.1,
         "liquid_scale":  1.0,
@@ -710,12 +796,8 @@ def train_ssd_lnn_all_appliances(house_number=1, window_size=128, save_dir="mode
         os.makedirs(appliance_dir, exist_ok=True)
 
         try:
-            data_dict = load_and_preprocess_ukdale(
-                file_path,
-                appliance_idx,
-                window_size=window_size,
-                target_size=1,
-            )
+            data_dict = prepare_appliance_data(raw_data, appliance_name, window_size=window_size)
+            data_dict["threshold"] = THRESHOLDS[appliance_name]
 
             model, history, best_model_path = train_ssd_lnn_model(
                 data_dict, model_params, train_params,

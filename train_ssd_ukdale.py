@@ -24,14 +24,16 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from tqdm import tqdm
 
-# ── Shared Source Code modules (data loader + NILM metrics) ──
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Source Code'))
-from data_loader import load_and_preprocess_ukdale, explore_available_appliances
 from utils import calculate_nilm_metrics, save_model
 
-# ── Reuse model architecture from train_ssd_lnn.py ──
+# ── Reuse model architecture and data helpers from train_ssd_lnn.py ──
 sys.path.insert(0, os.path.dirname(__file__))
-from train_ssd_lnn import SSDLNNConfig, Mamba3LNNRegressor, get_device
+from train_ssd_lnn import (
+    SSDLNNConfig, Mamba3LNNRegressor, get_device,
+    APPLIANCES, THRESHOLDS,
+    load_data, prepare_appliance_data,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -136,10 +138,12 @@ def train_ssd_model(data_dict, model_params, train_params, save_dir='models'):
 
         all_targets = np.concatenate(all_targets)
         all_outputs = np.concatenate(all_outputs)
-        metrics = calculate_nilm_metrics(
-            all_targets, all_outputs,
-            scaler=data_dict.get('appliance_scaler'),
-        )
+        y_scaler = data_dict.get('y_scaler')
+        if y_scaler is not None:
+            all_targets = y_scaler.inverse_transform(all_targets.reshape(-1, 1)).flatten()
+            all_outputs = y_scaler.inverse_transform(all_outputs.reshape(-1, 1)).flatten()
+        threshold = data_dict.get('threshold', 10.0)
+        metrics = calculate_nilm_metrics(all_targets, all_outputs, threshold=threshold)
         history['val_metrics'].append(metrics)
 
         print(
@@ -205,7 +209,7 @@ def train_ssd_model(data_dict, model_params, train_params, save_dir='models'):
 # Train on All Appliances
 # ──────────────────────────────────────────────────────────────────────────────
 
-def train_ssd_all_appliances(house_number=1, window_size=128, save_dir='models/ssd'):
+def train_ssd_all_appliances(house_number=1, window_size=100, save_dir='models/ssd'):
     """Train SSD on all appliances in the specified UK-DALE house.
 
     Args:
@@ -217,21 +221,20 @@ def train_ssd_all_appliances(house_number=1, window_size=128, save_dir='models/s
         (results dict, base_save_dir)
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_save = os.path.join(save_dir, f"house{house_number}_{timestamp}")
+    base_save = os.path.join(save_dir, f"run_{timestamp}")
     os.makedirs(base_save, exist_ok=True)
 
-    file_path  = f"preprocessed_datasets/ukdale/ukdale{house_number}.mat"
-    appliances = explore_available_appliances(file_path)
+    raw_data   = load_data()
+    appliances = {i: name for i, name in enumerate(APPLIANCES)}
 
-    print(f"Training SSD models for {len(appliances)} appliances in house {house_number}:")
+    print(f"Training SSD models for {len(appliances)} appliances:")
     for idx, name in appliances.items():
         print(f"  Index {idx}: {name}")
 
     config = {
-        'house_number': house_number,
-        'window_size':  window_size,
-        'timestamp':    timestamp,
-        'appliances':   appliances,
+        'window_size': window_size,
+        'timestamp':   timestamp,
+        'appliances':  appliances,
     }
     with open(os.path.join(base_save, 'config.json'), 'w') as f:
         json.dump(config, f, indent=4)
@@ -244,7 +247,7 @@ def train_ssd_all_appliances(house_number=1, window_size=128, save_dir='models/s
         'd_state':      16,
         'expand':       2,
         'headdim':      16,
-        'chunk_size':   32,
+        'chunk_size':   25,
         'use_liquid':   False,
     }
     train_params = {'lr': 0.001, 'epochs': 80, 'patience': 20}
@@ -260,12 +263,8 @@ def train_ssd_all_appliances(house_number=1, window_size=128, save_dir='models/s
         os.makedirs(appliance_dir, exist_ok=True)
 
         try:
-            data_dict = load_and_preprocess_ukdale(
-                file_path,
-                appliance_idx,
-                window_size=window_size,
-                target_size=1,
-            )
+            data_dict = prepare_appliance_data(raw_data, appliance_name, window_size=window_size)
+            data_dict['threshold'] = THRESHOLDS[appliance_name]
 
             model, history, best_model_path = train_ssd_model(
                 data_dict, model_params, train_params,
