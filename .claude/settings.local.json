@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(python -c ' *)",
-      "Bash(py -c ' *)"
+      "Bash(py -c ' *)",
+      "Bash(py -c \"import ast; ast.parse\\(open\\('c:/Users/MathK/OneDrive/Desktop/PhD_Slides/mamba3-minimal-clone/train_ssd_ukdale.py'\\).read\\(\\)\\); print\\('OK'\\)\")"
     ]
   }
 }
