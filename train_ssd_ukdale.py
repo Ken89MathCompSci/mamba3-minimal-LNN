@@ -92,6 +92,7 @@ def train_ssd_model(data_dict, model_params, train_params, save_dir='models'):
 
     history = {'train_loss': [], 'val_loss': [], 'val_metrics': []}
     best_val_loss   = float('inf')
+    best_state      = None
     best_model_path = None
     counter         = 0
 
@@ -157,6 +158,7 @@ def train_ssd_model(data_dict, model_params, train_params, save_dir='models'):
         if avg_val_loss < best_val_loss:
             best_val_loss   = avg_val_loss
             counter         = 0
+            best_state      = {k: v.clone() for k, v in model.state_dict().items()}
             best_model_path = os.path.join(save_dir, 'ssd_model_best.pth')
             save_model(model, model_params, train_params, metrics, best_model_path)
             print(f"Model saved to {best_model_path}")
@@ -168,6 +170,40 @@ def train_ssd_model(data_dict, model_params, train_params, save_dir='models'):
                 break
 
     print("Training completed!")
+
+    # ── Test evaluation (best checkpoint) ──
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    test_loader = data_dict.get('test_loader')
+    test_metrics = {}
+    if test_loader is not None:
+        model.eval()
+        test_targets = []
+        test_outputs = []
+        with torch.no_grad():
+            for inputs, targets in test_loader:
+                inputs  = inputs.to(device)
+                targets = targets.to(device)
+                outputs = model(inputs)
+                test_targets.append(targets.cpu().numpy())
+                test_outputs.append(outputs.cpu().numpy())
+
+        test_targets = np.concatenate(test_targets)
+        test_outputs = np.concatenate(test_outputs)
+        y_scaler = data_dict.get('y_scaler')
+        if y_scaler is not None:
+            test_targets = y_scaler.inverse_transform(test_targets.reshape(-1, 1)).flatten()
+            test_outputs = y_scaler.inverse_transform(test_outputs.reshape(-1, 1)).flatten()
+        threshold = data_dict.get('threshold', 10.0)
+        test_metrics = calculate_nilm_metrics(test_targets, test_outputs, threshold=threshold)
+        print(
+            f"Test  MAE: {test_metrics['mae']:.4f}  "
+            f"SAE: {test_metrics['sae']:.4f}  "
+            f"F1: {test_metrics['f1']:.4f}  "
+            f"P: {test_metrics['precision']:.4f}  "
+            f"R: {test_metrics['recall']:.4f}"
+        )
 
     final_path = os.path.join(save_dir, 'ssd_model_final.pth')
     save_model(model, model_params, train_params, metrics, final_path)
@@ -198,11 +234,12 @@ def train_ssd_model(data_dict, model_params, train_params, save_dir='models'):
                 'train_loss':  [float(v) for v in history['train_loss']],
                 'val_loss':    [float(v) for v in history['val_loss']],
                 'val_metrics': [{k: float(v) for k, v in m.items()} for m in history['val_metrics']],
+                'test_metrics': {k: float(v) for k, v in test_metrics.items()} if test_metrics else {},
             },
             f, indent=4,
         )
 
-    return model, history, best_model_path
+    return model, history, best_model_path, test_metrics
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -266,7 +303,7 @@ def train_ssd_all_appliances(house_number=1, window_size=100, save_dir='models/s
             data_dict = prepare_appliance_data(raw_data, appliance_name, window_size=window_size)
             data_dict['threshold'] = THRESHOLDS[appliance_name]
 
-            model, history, best_model_path = train_ssd_model(
+            model, history, best_model_path, test_metrics = train_ssd_model(
                 data_dict, model_params, train_params,
                 save_dir=appliance_dir,
             )
@@ -275,6 +312,7 @@ def train_ssd_all_appliances(house_number=1, window_size=100, save_dir='models/s
                 'model_path':      best_model_path,
                 'appliance_index': appliance_idx,
                 'final_metrics':   history['val_metrics'][-1] if history['val_metrics'] else None,
+                'test_metrics':    test_metrics,
                 'history':         history,
             }
             print(f"Successfully trained SSD model for {appliance_name}")
@@ -291,6 +329,8 @@ def train_ssd_all_appliances(house_number=1, window_size=100, save_dir='models/s
                 'model_path':    info['model_path'],
                 'final_metrics': {k: float(v) for k, v in info['final_metrics'].items()}
                                   if info['final_metrics'] else None,
+                'test_metrics':  {k: float(v) for k, v in info['test_metrics'].items()}
+                                  if info.get('test_metrics') else None,
             }
             for name, info in results.items()
         },

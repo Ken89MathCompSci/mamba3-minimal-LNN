@@ -618,6 +618,7 @@ def train_ssd_lnn_model(data_dict, model_params, train_params, save_dir="models"
 
     history = {"train_loss": [], "val_loss": [], "val_metrics": []}
     best_val_loss   = float("inf")
+    best_state      = None
     best_model_path = None
     counter         = 0
 
@@ -682,6 +683,7 @@ def train_ssd_lnn_model(data_dict, model_params, train_params, save_dir="models"
         # ── Early stopping + checkpoint ──
         if avg_val_loss < best_val_loss:
             best_val_loss   = avg_val_loss
+            best_state      = {k: v.clone() for k, v in model.state_dict().items()}
             counter         = 0
             best_model_path = os.path.join(save_dir, "ssd_lnn_model_best.pth")
             save_model(model, model_params, train_params, metrics, best_model_path)
@@ -695,9 +697,32 @@ def train_ssd_lnn_model(data_dict, model_params, train_params, save_dir="models"
 
     print("Training completed!")
 
+    # ── Test evaluation (best model weights) ──
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    test_preds, test_trues = [], []
+    with torch.no_grad():
+        for inputs, targets in data_dict["test_loader"]:
+            test_preds.append(model(inputs.to(device)).cpu().numpy())
+            test_trues.append(targets.cpu().numpy())
+
+    test_targets = np.concatenate(test_trues)
+    test_outputs = np.concatenate(test_preds)
+    y_scaler = data_dict.get("y_scaler")
+    if y_scaler is not None:
+        test_targets = y_scaler.inverse_transform(test_targets.reshape(-1, 1)).flatten()
+        test_outputs = y_scaler.inverse_transform(test_outputs.reshape(-1, 1)).flatten()
+    threshold = data_dict.get("threshold", 10.0)
+    test_metrics = calculate_nilm_metrics(test_targets, test_outputs, threshold=threshold)
+
+    print(f"Test MAE={test_metrics['mae']:.4f}  SAE={test_metrics['sae']:.4f}  "
+          f"F1={test_metrics['f1']:.4f}  P={test_metrics['precision']:.4f}  "
+          f"R={test_metrics['recall']:.4f}")
+
     # ── Save final checkpoint ──
     final_path = os.path.join(save_dir, "ssd_lnn_model_final.pth")
-    save_model(model, model_params, train_params, metrics, final_path)
+    save_model(model, model_params, train_params, test_metrics, final_path)
 
     # ── Training history plot (mirrors train_tcn_lnn.py) ──
     plt.figure(figsize=(12, 4))
@@ -722,14 +747,15 @@ def train_ssd_lnn_model(data_dict, model_params, train_params, save_dir="models"
     with open(os.path.join(save_dir, "ssd_lnn_history.json"), "w") as f:
         json.dump(
             {
-                "train_loss":  [float(v) for v in history["train_loss"]],
-                "val_loss":    [float(v) for v in history["val_loss"]],
-                "val_metrics": [{k: float(v) for k, v in m.items()} for m in history["val_metrics"]],
+                "train_loss":   [float(v) for v in history["train_loss"]],
+                "val_loss":     [float(v) for v in history["val_loss"]],
+                "val_metrics":  [{k: float(v) for k, v in m.items()} for m in history["val_metrics"]],
+                "test_metrics": {k: float(v) for k, v in test_metrics.items()},
             },
             f, indent=4,
         )
 
-    return model, history, best_model_path
+    return model, history, best_model_path, test_metrics
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -799,16 +825,17 @@ def train_ssd_lnn_all_appliances(house_number=1, window_size=100, save_dir="mode
             data_dict = prepare_appliance_data(raw_data, appliance_name, window_size=window_size)
             data_dict["threshold"] = THRESHOLDS[appliance_name]
 
-            model, history, best_model_path = train_ssd_lnn_model(
+            model, history, best_model_path, test_metrics = train_ssd_lnn_model(
                 data_dict, model_params, train_params,
                 save_dir=appliance_dir,
             )
 
             results[appliance_name] = {
-                "model_path":    best_model_path,
+                "model_path":      best_model_path,
                 "appliance_index": appliance_idx,
-                "final_metrics": history["val_metrics"][-1] if history["val_metrics"] else None,
-                "history":       history,
+                "final_metrics":   history["val_metrics"][-1] if history["val_metrics"] else None,
+                "test_metrics":    test_metrics,
+                "history":         history,
             }
             print(f"Successfully trained SSD-LNN model for {appliance_name}")
 
