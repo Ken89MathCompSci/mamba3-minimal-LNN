@@ -1,7 +1,8 @@
 """
 train_ssd_lnn.py
 ================
-Integrates Liquid Neural Network (LNN) dynamics into the Mamba-3 SSD algorithm.
+Integrates Liquid Neural Network (LNN) dynamics into the Mamba-3 SSD algorithm,
+trained on the UK-DALE dataset for Non-Intrusive Load Monitoring (NILM).
 
 LNN Key Idea (Hasani et al., 2021 — Liquid Time-Constant Networks):
     Standard SSM:  h_t = exp(A·Δt) · h_{t-1} + B·x_t             (fixed per-head decay)
@@ -13,15 +14,14 @@ The LiquidGate module maps the SSM input to a per-head, per-timestep modulation
 of the log-decay, making time constants data-dependent. This is injected into
 ssd_lnn() which otherwise runs the standard Mamba-2/3 chunked SSD unchanged.
 
-Training Task — Damped-Oscillation Regression:
-    Sequences of the form  y(t) = sin(ω·t) · exp(-γ·t),  γ ~ Uniform(0.01, 0.5)
-    The model sees a window of past values and must predict the next one.
-    Since γ varies per sequence, a model with data-dependent time constants (LNN)
-    can infer γ from context and adapt its forgetting rate accordingly —
-    directly demonstrating the advantage of LNN over fixed-decay SSMs.
+Training Task — NILM on UK-DALE:
+    Given a window of aggregate mains power, predict the power consumption of a
+    target appliance (sequence-to-point). Metrics follow calculate_nilm_metrics:
+    MAE (regression), SAE (aggregate energy error), F1 (on/off classification).
 """
 
 import os
+import sys
 import json
 import math
 import numpy as np
@@ -33,9 +33,14 @@ import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from datetime import datetime
 from torch import Tensor
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from einops import rearrange, repeat
+
+# Import shared data loading and metric utilities
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Source Code'))
+from data_loader import load_and_preprocess_ukdale, explore_available_appliances
+from utils import calculate_nilm_metrics, save_model
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -474,106 +479,15 @@ class Mamba3LNNRegressor(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Synthetic Dataset — Damped Oscillations with Variable Damping
-# ──────────────────────────────────────────────────────────────────────────────
-
-def generate_damped_oscillation_dataset(
-    n_sequences: int = 4000,
-    seq_len: int = 128,
-    window_size: int = 64,
-    gamma_range: tuple = (0.01, 0.5),
-    omega_range: tuple = (0.5, 3.0),
-    noise_std: float = 0.02,
-    val_fraction: float = 0.2,
-    seed: int = 42,
-    batch_size: int = 64,
-    chunk_size: int = 32,
-):
-    """Generate sliding-window dataset of damped oscillations.
-
-    Each sequence:  y(t) = sin(ω·t + φ) · exp(-γ·t)
-    where γ ~ Uniform(gamma_range) and ω ~ Uniform(omega_range).
-
-    Task: given a window of `window_size` timesteps, predict the next value.
-
-    The window_size is padded to the nearest multiple of chunk_size so it
-    can be processed by the chunked SSD algorithm without remainder.
-
-    Returns a dict with train_loader, val_loader, and metadata.
-    """
-    rng = np.random.default_rng(seed)
-
-    # Round window_size up to nearest multiple of chunk_size
-    if window_size % chunk_size != 0:
-        window_size = ((window_size // chunk_size) + 1) * chunk_size
-        print(f"[dataset] window_size padded to {window_size} (multiple of chunk_size={chunk_size})")
-
-    t = np.linspace(0, 6 * math.pi, seq_len + 1)
-
-    X_list, y_list = [], []
-    for _ in range(n_sequences):
-        gamma = rng.uniform(*gamma_range)
-        omega = rng.uniform(*omega_range)
-        phi   = rng.uniform(0, 2 * math.pi)
-
-        signal = np.sin(omega * t + phi) * np.exp(-gamma * t)
-        signal += rng.normal(0, noise_std, size=signal.shape)
-
-        # Slide over valid positions
-        for start in range(seq_len - window_size):
-            window = signal[start : start + window_size]
-            target = signal[start + window_size]
-            X_list.append(window)
-            y_list.append(target)
-
-    X = torch.tensor(np.array(X_list), dtype=torch.float32).unsqueeze(-1)  # (N, window, 1)
-    y = torch.tensor(np.array(y_list), dtype=torch.float32).unsqueeze(-1)  # (N, 1)
-
-    n_val = int(len(X) * val_fraction)
-    idx   = torch.randperm(len(X), generator=torch.Generator().manual_seed(seed))
-    train_idx, val_idx = idx[n_val:], idx[:n_val]
-
-    train_ds = TensorDataset(X[train_idx], y[train_idx])
-    val_ds   = TensorDataset(X[val_idx],   y[val_idx])
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  drop_last=True)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, drop_last=False)
-
-    print(f"[dataset] {len(train_ds)} train / {len(val_ds)} val samples  "
-          f"| window={window_size}  chunk_size={chunk_size}")
-    return {
-        "train_loader": train_loader,
-        "val_loader":   val_loader,
-        "window_size":  window_size,
-        "input_dim":    1,
-        "output_dim":   1,
-    }
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Metrics
-# ──────────────────────────────────────────────────────────────────────────────
-
-def calculate_regression_metrics(targets: np.ndarray, preds: np.ndarray) -> dict:
-    """Compute MAE, RMSE, and R² for regression evaluation."""
-    mae  = float(np.mean(np.abs(targets - preds)))
-    rmse = float(np.sqrt(np.mean((targets - preds) ** 2)))
-    ss_res = np.sum((targets - preds) ** 2)
-    ss_tot = np.sum((targets - targets.mean()) ** 2)
-    r2   = float(1 - ss_res / (ss_tot + 1e-8))
-    return {"mae": mae, "rmse": rmse, "r2": r2}
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Training Loop  (mirrors train_tcn_lnn.py structure)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def train_ssd_lnn_model(data_dict, model_params, train_params, save_dir="models"):
-    """Train a Mamba3LNN (or baseline Mamba3 SISO) regression model.
+    """Train a Mamba3LNN regression model on UK-DALE NILM data.
 
     Args:
-        data_dict:    dict from generate_damped_oscillation_dataset()
-        model_params: dict with SSDLNNConfig fields + optionally use_liquid flag
+        data_dict:    dict from load_and_preprocess_ukdale()
+        model_params: dict with SSDLNNConfig fields
         train_params: dict with lr, epochs, patience
         save_dir:     directory to save checkpoints and plots
 
@@ -601,19 +515,18 @@ def train_ssd_lnn_model(data_dict, model_params, train_params, save_dir="models"
     device = get_device()
     model  = Mamba3LNNRegressor(
         cfg,
-        input_dim  = data_dict["input_dim"],
-        output_dim = data_dict["output_dim"],
+        input_dim  = data_dict["input_size"],
+        output_dim = data_dict["output_size"],
         device     = device,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    tag = "SSD-LNN" if cfg.use_liquid else "SSD-Baseline"
-    print(f"\nStarting {tag} training on {device} | params: {n_params:,}")
+    print(f"\nStarting SSD-LNN training on {device} | params: {n_params:,}")
 
     # ── Optimizer + loss ──
     lr      = train_params.get("lr",       1e-3)
-    epochs  = train_params.get("epochs",    50)
-    patience= train_params.get("patience",  10)
+    epochs  = train_params.get("epochs",   80)
+    patience= train_params.get("patience", 20)
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
@@ -627,7 +540,7 @@ def train_ssd_lnn_model(data_dict, model_params, train_params, save_dir="models"
         # ── Training phase ──
         model.train()
         train_loss = 0.0
-        bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [{tag}]")
+        bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
         for inputs, targets in bar:
             inputs  = inputs.to(device)
             targets = targets.to(device)
@@ -666,67 +579,60 @@ def train_ssd_lnn_model(data_dict, model_params, train_params, save_dir="models"
 
         all_targets = np.concatenate(all_targets)
         all_outputs = np.concatenate(all_outputs)
-        metrics = calculate_regression_metrics(all_targets, all_outputs)
+        metrics = calculate_nilm_metrics(
+            all_targets, all_outputs,
+            scaler=data_dict.get("appliance_scaler"),
+        )
         history["val_metrics"].append(metrics)
 
         print(
-            f"Epoch {epoch+1}/{epochs}  "
-            f"Train: {avg_train_loss:.6f}  Val: {avg_val_loss:.6f}  "
-            f"MAE: {metrics['mae']:.4f}  RMSE: {metrics['rmse']:.4f}  R²: {metrics['r2']:.4f}"
+            f"Epoch {epoch+1}/{epochs}, "
+            f"Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, "
+            f"Val MAE: {metrics['mae']:.2f}, Val SAE: {metrics['sae']:.4f}, "
+            f"Val F1: {metrics['f1']:.4f}"
         )
 
         # ── Early stopping + checkpoint ──
         if avg_val_loss < best_val_loss:
             best_val_loss   = avg_val_loss
             counter         = 0
-            best_model_path = os.path.join(save_dir, "best_model.pth")
-            torch.save({
-                "model_state": model.state_dict(),
-                "model_params": model_params,
-                "train_params": train_params,
-                "metrics": metrics,
-            }, best_model_path)
-            print(f"  ✓ Saved best model → {best_model_path}")
+            best_model_path = os.path.join(save_dir, "ssd_lnn_model_best.pth")
+            save_model(model, model_params, train_params, metrics, best_model_path)
+            print(f"Model saved to {best_model_path}")
         else:
             counter += 1
-            print(f"  EarlyStopping counter: {counter}/{patience}")
+            print(f"EarlyStopping counter: {counter} out of {patience}")
             if counter >= patience:
-                print("  Early stopping triggered.")
+                print("Early stopping triggered")
                 break
 
-    print(f"{tag} training complete.\n")
+    print("Training completed!")
 
     # ── Save final checkpoint ──
-    final_path = os.path.join(save_dir, "final_model.pth")
-    torch.save({"model_state": model.state_dict(), "model_params": model_params}, final_path)
+    final_path = os.path.join(save_dir, "ssd_lnn_model_final.pth")
+    save_model(model, model_params, train_params, metrics, final_path)
 
-    # ── Loss curves ──
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    fig.suptitle(f"{tag} — Training History", fontsize=13, fontweight="bold")
+    # ── Training history plot (mirrors train_tcn_lnn.py) ──
+    plt.figure(figsize=(12, 4))
 
-    epochs_x = range(1, len(history["train_loss"]) + 1)
+    plt.subplot(1, 2, 1)
+    plt.plot(history["train_loss"], label="Train Loss")
+    plt.plot(history["val_loss"],   label="Validation Loss")
+    plt.title("Training and Validation Loss")
+    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.legend()
 
-    axes[0].plot(epochs_x, history["train_loss"], label="Train")
-    axes[0].plot(epochs_x, history["val_loss"],   label="Val")
-    axes[0].set_title("MSE Loss"); axes[0].set_xlabel("Epoch"); axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
-
-    mae_vals  = [m["mae"]  for m in history["val_metrics"]]
-    rmse_vals = [m["rmse"] for m in history["val_metrics"]]
-    r2_vals   = [m["r2"]   for m in history["val_metrics"]]
-
-    axes[1].plot(epochs_x, mae_vals,  color="#29B5C8"); axes[1].set_title("Val MAE")
-    axes[1].set_xlabel("Epoch"); axes[1].grid(True, alpha=0.3)
-
-    axes[2].plot(epochs_x, r2_vals, color="#E8851B"); axes[2].set_title("Val R²")
-    axes[2].set_xlabel("Epoch"); axes[2].grid(True, alpha=0.3)
+    plt.subplot(1, 2, 2)
+    val_mae = [m["mae"] for m in history["val_metrics"]]
+    plt.plot(val_mae, label="Validation MAE")
+    plt.title("Validation MAE")
+    plt.xlabel("Epoch"); plt.ylabel("MAE"); plt.legend()
 
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "training_history.png"), dpi=150, bbox_inches="tight")
+    plt.savefig(os.path.join(save_dir, "ssd_lnn_training_history.png"))
     plt.close()
 
     # ── Save history JSON ──
-    with open(os.path.join(save_dir, "history.json"), "w") as f:
+    with open(os.path.join(save_dir, "ssd_lnn_history.json"), "w") as f:
         json.dump(
             {
                 "train_loss":  [float(v) for v in history["train_loss"]],
@@ -740,107 +646,153 @@ def train_ssd_lnn_model(data_dict, model_params, train_params, save_dir="models"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Compare Baseline vs SSD-LNN
+# Train on All Appliances  (mirrors train_tcn_lnn_all_appliances)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def train_ssd_lnn_all_configs(save_dir="models/ssd_lnn"):
-    """Train both the Mamba-3 SISO baseline and the SSD-LNN model, then compare.
+def train_ssd_lnn_all_appliances(house_number=1, window_size=128, save_dir="models/ssd_lnn"):
+    """Train SSD-LNN on all appliances in the specified UK-DALE house.
 
-    Results are saved to:
-        save_dir/baseline/   — standard Mamba-3 SISO (use_liquid=False)
-        save_dir/lnn/        — SSD-LNN (use_liquid=True)
-        save_dir/comparison.png  — side-by-side metric curves
-        save_dir/summary.json    — final metrics for both models
+    window_size is set to 128 (nearest multiple of chunk_size=32 above the
+    standard 100-sample window) so the chunked SSD can process it evenly.
+
+    Args:
+        house_number: House number in the UK-DALE dataset
+        window_size:  Input sequence length (must be divisible by chunk_size=32)
+        save_dir:     Directory to save the models
+
+    Returns:
+        (results dict, base_save_dir)
     """
     timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_save    = os.path.join(save_dir, timestamp)
+    base_save    = os.path.join(save_dir, f"house{house_number}_{timestamp}")
     os.makedirs(base_save, exist_ok=True)
 
-    # ── Shared dataset ──
-    data_dict = generate_damped_oscillation_dataset(
-        n_sequences  = 4000,
-        seq_len      = 128,
-        window_size  = 64,
-        gamma_range  = (0.01, 0.5),
-        omega_range  = (0.5, 3.0),
-        noise_std    = 0.02,
-        val_fraction = 0.2,
-        batch_size   = 64,
-        chunk_size   = 32,
-    )
+    file_path  = f"preprocessed_datasets/ukdale/ukdale{house_number}.mat"
+    appliances = explore_available_appliances(file_path)
 
-    # ── Shared model/training params ──
-    model_params_base = dict(
-        d_model     = 64,
-        n_layer     = 2,
-        d_state     = 16,
-        expand      = 2,
-        headdim     = 16,
-        chunk_size  = 32,
-    )
-    train_params = dict(lr=1e-3, epochs=60, patience=15)
+    print(f"Training SSD-LNN models for {len(appliances)} appliances in house {house_number}:")
+    for idx, name in appliances.items():
+        print(f"  Index {idx}: {name}")
+
+    # Save run config
+    config = {
+        "house_number": house_number,
+        "window_size":  window_size,
+        "timestamp":    timestamp,
+        "appliances":   appliances,
+    }
+    with open(os.path.join(base_save, "config.json"), "w") as f:
+        json.dump(config, f, indent=4)
+
+    model_params = {
+        "input_size":    1,
+        "output_size":   1,
+        "d_model":       64,
+        "n_layer":       2,
+        "d_state":       16,
+        "expand":        2,
+        "headdim":       16,
+        "chunk_size":    32,
+        "use_liquid":    True,
+        "tau_min":       0.1,
+        "liquid_scale":  1.0,
+    }
+    train_params = {"lr": 0.001, "epochs": 80, "patience": 20}
 
     results = {}
 
-    for use_liquid, tag in [(False, "baseline"), (True, "lnn")]:
-        mp = {**model_params_base, "use_liquid": use_liquid, "tau_min": 0.1, "liquid_scale": 1.0}
-        model, history, best_path = train_ssd_lnn_model(
-            data_dict, mp, train_params,
-            save_dir=os.path.join(base_save, tag),
-        )
-        results[tag] = {"history": history, "best_model_path": best_path}
+    for appliance_idx, appliance_name in appliances.items():
+        print(f"\n{'-'*50}")
+        print(f"Training SSD-LNN model for {appliance_name} (index {appliance_idx})")
+        print(f"{'-'*50}\n")
 
-    # ── Comparison plot ──
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    fig.suptitle("SSD-LNN vs Mamba-3 SISO Baseline — Damped Oscillation Regression",
-                 fontsize=13, fontweight="bold")
+        appliance_dir = os.path.join(base_save, appliance_name)
+        os.makedirs(appliance_dir, exist_ok=True)
 
-    colors = {"baseline": "#888888", "lnn": "#29B5C8"}
-    labels = {"baseline": "Mamba-3 SISO (baseline)", "lnn": "SSD-LNN (ours)"}
+        try:
+            data_dict = load_and_preprocess_ukdale(
+                file_path,
+                appliance_idx,
+                window_size=window_size,
+                target_size=1,
+            )
 
-    for tag, info in results.items():
-        vm = info["history"]["val_metrics"]
-        ex = range(1, len(vm) + 1)
-        c  = colors[tag]
-        l  = labels[tag]
-        axes[0].plot(ex, info["history"]["val_loss"], color=c, label=l, linewidth=1.5)
-        axes[1].plot(ex, [m["mae"]  for m in vm],    color=c, label=l, linewidth=1.5)
-        axes[2].plot(ex, [m["r2"]   for m in vm],    color=c, label=l, linewidth=1.5)
+            model, history, best_model_path = train_ssd_lnn_model(
+                data_dict, model_params, train_params,
+                save_dir=appliance_dir,
+            )
 
-    for ax, title, ylabel in zip(
-        axes,
-        ["Validation MSE Loss", "Validation MAE", "Validation R²"],
-        ["MSE",  "MAE",  "R²"],
-    ):
-        ax.set_title(title); ax.set_xlabel("Epoch"); ax.set_ylabel(ylabel)
-        ax.legend(); ax.grid(True, alpha=0.3)
+            results[appliance_name] = {
+                "model_path":    best_model_path,
+                "appliance_index": appliance_idx,
+                "final_metrics": history["val_metrics"][-1] if history["val_metrics"] else None,
+                "history":       history,
+            }
+            print(f"Successfully trained SSD-LNN model for {appliance_name}")
 
-    plt.tight_layout()
-    plt.savefig(os.path.join(base_save, "comparison.png"), dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"\nComparison plot saved → {base_save}/comparison.png")
+        except Exception as e:
+            print(f"Error training SSD-LNN model for {appliance_name}: {str(e)}")
 
     # ── Summary JSON ──
-    summary = {}
-    for tag, info in results.items():
-        final_metrics = info["history"]["val_metrics"][-1]
-        summary[tag] = {
-            "best_model_path": info["best_model_path"],
-            "final_val_loss":  float(info["history"]["val_loss"][-1]),
-            "final_metrics":   {k: float(v) for k, v in final_metrics.items()},
-        }
+    summary = {
+        "timestamp":    timestamp,
+        "house_number": house_number,
+        "results": {
+            name: {
+                "model_path":    info["model_path"],
+                "final_metrics": {k: float(v) for k, v in info["final_metrics"].items()}
+                                  if info["final_metrics"] else None,
+            }
+            for name, info in results.items()
+        },
+    }
     with open(os.path.join(base_save, "summary.json"), "w") as f:
         json.dump(summary, f, indent=4)
 
-    # ── Print comparison table ──
-    print("\n" + "=" * 55)
-    print(f"{'Model':<25} {'MAE':>8} {'RMSE':>8} {'R²':>8}")
-    print("-" * 55)
-    for tag, info in summary.items():
-        m = info["final_metrics"]
-        print(f"{labels[tag]:<25} {m['mae']:>8.4f} {m['rmse']:>8.4f} {m['r2']:>8.4f}")
-    print("=" * 55)
-    print(f"\nAll results saved to {base_save}")
+    # ── Combined val metrics plot (appliances × metrics grid) ──
+    trained = {
+        name: info for name, info in results.items()
+        if info.get("history") and info["history"]["val_metrics"]
+    }
+    if trained:
+        n_apps = len(trained)
+        fig, axes = plt.subplots(n_apps, 3, figsize=(15, 4 * n_apps))
+        if n_apps == 1:
+            axes = [axes]
+        fig.suptitle(
+            f"Val Metrics per Epoch — SSD-LNN (80 epochs)",
+            fontsize=13, fontweight="bold",
+        )
+
+        for row, (app_name, info) in enumerate(trained.items()):
+            vm       = info["history"]["val_metrics"]
+            epochs_x = range(1, len(vm) + 1)
+            mae_vals = [m["mae"] for m in vm]
+            sae_vals = [m["sae"] for m in vm]
+            f1_vals  = [m["f1"]  for m in vm]
+
+            for col, (vals, ylabel, title) in enumerate([
+                (mae_vals, "MAE (W)",  f"{app_name} — MAE (W)"),
+                (sae_vals, "SAE",      f"{app_name} — SAE"),
+                (f1_vals,  "F1",       f"{app_name} — F1"),
+            ]):
+                ax = axes[row][col]
+                ax.plot(epochs_x, vals, color="#29B5C8", linewidth=1.5)
+                ax.set_title(title, fontsize=10)
+                ax.set_xlabel("Epoch", fontsize=8)
+                ax.set_ylabel(ylabel, fontsize=8)
+                ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(base_save, "ssd_lnn_val_metrics.png"),
+            dpi=150, bbox_inches="tight",
+        )
+        plt.close()
+        print(f"Val metrics plot saved to {base_save}/ssd_lnn_val_metrics.png")
+
+    print("\nSSD-LNN training completed for all appliances!")
+    print(f"Results saved to {base_save}")
 
     return results, base_save
 
@@ -850,4 +802,4 @@ def train_ssd_lnn_all_configs(save_dir="models/ssd_lnn"):
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    results, save_dir = train_ssd_lnn_all_configs(save_dir="models/ssd_lnn")
+    results, save_dir = train_ssd_lnn_all_appliances(house_number=5)
